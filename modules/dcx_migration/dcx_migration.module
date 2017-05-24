@@ -1,9 +1,16 @@
 <?php
 
 /**
+ * @file
+ */
+
+use Drupal\Core\Database\Database;
+use Drupal\Core\Entity\EntityInterface;
+
+/**
  * Implements hook_ENTITY_TYPE_delete().
  */
-function dcx_migration_media_delete(Drupal\Core\Entity\EntityInterface $entity) {
+function dcx_migration_media_delete(EntityInterface $entity) {
   // Remove the migrate map entry for this entity to allow remigration if the
   // table exists.
   if (db_table_exists('migrate_map_dcx_migration')) {
@@ -13,4 +20,3 @@ function dcx_migration_media_delete(Drupal\Core\Entity\EntityInterface $entity) 
       ->execute();
   }
 }
-
