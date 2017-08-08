@@ -4,7 +4,18 @@
   "description": "Module DC-X Integration",
   "license": "GPL-2.0",
   "minimum-stability": "dev",
+  "prefer-stable": true,
+  "repositories": [
+	{
+	  "type": "composer",
+	  "url": "https://packages.drupal.org/8"
+	}
+  ],
+  "require": {
+	"drupal/migrate_plus": ">=3.0",
+	"digicol/dcx-sdk-php": "^2.0"
+  },
   "require-dev": {
-    "burdamagazinorg/thunder-dev-tools": "dev-master"
+	"burdamagazinorg/thunder-dev-tools": "dev-master"
   }
 }

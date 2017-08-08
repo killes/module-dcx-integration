@@ -2,6 +2,7 @@
 
 namespace Drupal\dcx_integration;
 
+use Digicol\DcxSdk\DcxApiClient;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\Core\Session\AccountProxyInterface;
@@ -22,16 +23,15 @@ use Drupal\dcx_integration\Exception\UnknownDocumentTypeException;
  * @package Drupal\dcx_integration
  */
 class JsonClient implements ClientInterface {
+
   use StringTranslationTrait;
 
   /**
    * Instance of the low level PHP JSON API Client provided by digicol.
    *
-   * See file api_client/dcx_api_client.class.php.
-   *
-   * @var \DCX_Api_Client
+   * @var \Digicol\DcxSdk\DcxApiClient
    */
-  protected $api_client;
+  protected $dcxApiClient;
 
   /**
    * JSON client settings.
@@ -39,18 +39,17 @@ class JsonClient implements ClientInterface {
    * @var \Drupal\Core\Config\ImmutableConfig
    */
   protected $config;
-  /**
-   * Constructor.
-   */
 
   /**
    * Publication ID from 'dcx_integration.jsonclientsettings'.
    *
    * @var string
    */
-  protected $publication_id;
+  protected $publicationId;
 
   /**
+   * Logger service.
+   *
    * @var \Psr\Log\LoggerInterface
    */
   protected $logger;
@@ -67,6 +66,7 @@ class JsonClient implements ClientInterface {
     if (!$override_client_class) {
       $current_user_email = $user->getEmail();
       $site_mail = $config_factory->get("system.site")->get('mail');
+      $site_name = $config_factory->get("system.site")->get('name');
 
       $url = $this->config->get('url');
       $username = $this->config->get('username');
@@ -79,20 +79,36 @@ class JsonClient implements ClientInterface {
         $current_user_email = "burda_ad/$current_user_email";
       }
 
-      global $base_url;
       $options = [
         'http_headers' => ['X-DCX-Run-As' => "$current_user_email"],
-        'http_useragent' => "DC-X Integration for Drupal (dcx_integration) running on $base_url <$site_mail>",
+        'http_useragent' => "DC-X Integration for Drupal (dcx_integration) running on $site_name <$site_mail>",
       ];
 
-      require drupal_get_path('module', 'dcx_integration') . '/api_client/dcx_api_client.class.php';
-      $this->api_client = new \DCX_Api_Client($url, $username, $password, $options);
+      $credentials = [
+        'username' => $username,
+        'password' => $password,
+      ];
+      $this->dcxApiClient = new DcxApiClient($url, $credentials, $options);
     }
     else {
-      $this->api_client = $override_client_class;
+      $this->dcxApiClient = $override_client_class;
     }
 
-    $this->publication_id = $this->config->get('publication');
+    $this->publicationId = $this->config->get('publication');
+  }
+
+  /**
+   * Does a server request on a non existing doc to check the server status.
+   */
+  public function checkServerStatus() {
+
+    $this->dcxApiClient->guzzleClient->request(
+      'GET',
+      $this->dcxApiClient->fullUrl('document'),
+      $this->dcxApiClient->getRequestOptions([
+        'query' => $this->dcxApiClient->mergeQuery('document', []),
+      ])
+    );
   }
 
   /**
@@ -123,11 +139,11 @@ class JsonClient implements ClientInterface {
     }
 
     $url = preg_replace('/^dcxapi:/', '', $id);
-    $http_status = $this->api_client->getObject($url, $params, $json);
+    $http_status = $this->dcxApiClient->get($url, $params, $json);
 
     if (200 !== $http_status) {
-      $exception = new DcxClientException('getObject', $http_status, $url, $params, $json);
-      $this->watchdog_exception(__METHOD__, $exception);
+      $exception = new DcxClientException('get', $http_status, $url, $params, $json);
+      $this->watchdogException(__METHOD__, $exception);
       throw $exception;
     }
 
@@ -135,22 +151,7 @@ class JsonClient implements ClientInterface {
   }
 
   /**
-   * Retrieve a DC-X object with the given id.
-   *
-   * Emits an HTTP request to the DC-X server and evaluates the response.
-   * Depending on the document "Type" (an attribute stored within the fields,
-   * not to be confused with the attribute "type") it returns subclasses of
-   * BaseAsset which encapsulate a flat array representation of the data
-   * retrieved.
-   *
-   * @param string $id
-   *   A dcx object identifier. Something like "dcxapi:document/xyz".
-   *
-   * @return \Drupal\dcx_integration\Asset\BaseAsset
-   *   An instance of BaseAsset depending on the retrieved data.
-   *
-   * @throws \Exception
-   *   Throws exceptions if anything fails.
+   * {@inheritdoc}
    */
   public function getObject($id) {
     $json = $this->getJson($id);
@@ -168,7 +169,7 @@ class JsonClient implements ClientInterface {
 
       default:
         $exception = new UnknownDocumentTypeException($type, $id);
-        $this->watchdog_exception(__METHOD__, $exception);
+        $this->watchdogException(__METHOD__, $exception);
         throw $exception;
     }
     return $asset;
@@ -177,12 +178,16 @@ class JsonClient implements ClientInterface {
   /**
    * Builds an Image object from given json array.
    *
+   * @param array $json
+   *   Data array.
+   *
    * @return \Drupal\dcx_integration\Asset\Image
    *   The Image object.
+   *
+   * @throws \Exception
+   *   If it's not possible to create an asset.
    */
-  protected function buildImageAsset($json) {
-    $data = [];
-
+  protected function buildImageAsset(array $json) {
     /*
      * Maps an asset attribute to
      *  - the keys of a nested array, or
@@ -198,30 +203,32 @@ class JsonClient implements ClientInterface {
       'source' => [[$this, 'joinValues'], 'fields', 'Creator'],
       'copyright' => ['fields', 'CopyrightNotice', 0, 'value'],
       'status' => [[$this, 'computeStatus']],
-      // Deliberately disabled. See comment in ::computeExpire
-      // 'kill_date' => [[$this, 'computeExpire']],.
     ];
 
     $data = $this->processAttributeMap($attribute_map, $json);
 
     try {
-      $asset = new Image($data);
+      return new Image($data);
     }
     catch (\Exception $e) {
-      $this->watchdog_exception(__METHOD__, $e);
+      $this->watchdogException(__METHOD__, $e);
       throw $e;
     }
-    return $asset;
   }
 
   /**
    * Builds an Article object from given json array.
    *
+   * @param array $json
+   *   Data array.
+   *
    * @return \Drupal\dcx_integration\Asset\Article
    *   The Article object.
+   *
+   * @throws \Exception
+   *   If it's not possible to create an asset.
    */
-  protected function buildArticleAsset($json) {
-    $data = [];
+  protected function buildArticleAsset(array $json) {
 
     $attribute_map = [
       'id' => ['_id'],
@@ -233,14 +240,12 @@ class JsonClient implements ClientInterface {
     $data = $this->processAttributeMap($attribute_map, $json);
 
     try {
-      $asset = new Article($data);
+      return new Article($data);
     }
     catch (\Exception $e) {
-      $this->watchdog_exception(__METHOD__, $e);
+      $this->watchdogException(__METHOD__, $e);
       throw $e;
     }
-    return $asset;
-
   }
 
   /**
@@ -252,9 +257,15 @@ class JsonClient implements ClientInterface {
    * callable [object, method] pair, arguments for further processing in this
    * very callable.
    *
-   * @return array of extracted data
+   * @param array $attribute_map
+   *   Array of attributes.
+   * @param array $source
+   *   Data array.
+   *
+   * @return array
+   *   Array of extracted data.
    */
-  protected function processAttributeMap($attribute_map, $source) {
+  protected function processAttributeMap(array $attribute_map, array $source) {
     $data = [];
 
     foreach ($attribute_map as $target_key => $source_keys) {
@@ -271,16 +282,19 @@ class JsonClient implements ClientInterface {
   }
 
   /**
-   * Descends in the nested array $json following the path of keys given in keys.
+   * Descends in the array $json following the path of keys given in keys.
    *
    * Returns whatever it finds there.
    *
-   * @param array $keys
    * @param array $json
+   *   Data array.
+   * @param array $keys
+   *   Keys to look for.
    *
-   * @return mixed $value
+   * @return mixed
+   *   Value of an asset.
    */
-  protected function extractData($json, $keys) {
+  protected function extractData(array $json, array $keys) {
     foreach ($keys as $key) {
       $json = !empty($json[$key]) ? $json[$key] : '';
     }
@@ -292,13 +306,15 @@ class JsonClient implements ClientInterface {
    *
    * This function "knows" where to look for the URL of the file in question.
    *
-   * @param array $keys
    * @param array $json
+   *   Data array.
+   * @param array $keys
+   *   Keys to look for.
    *
    * @return string
    *   URL referenced by the file_id nested in $keys.
    */
-  protected function extractUrl($json, $keys) {
+  protected function extractUrl(array $json, array $keys) {
     $file_id = $this->extractData($json, $keys);
 
     $file_url = $this->extractData($json, [
@@ -316,98 +332,79 @@ class JsonClient implements ClientInterface {
    *
    * This function "knows" where to look for the IDs  in question.
    *
-   * @param array $keys
    * @param array $json
+   *   Data array.
+   * @param array $keys
+   *   Keys to look for.
    *
-   * @return array of image IDs
+   * @return array
+   *   of image IDs
    */
-  protected function extractImageIds($json, $keys) {
+  protected function extractImageIds(array $json, array $keys) {
     $data = $this->extractData($json, $keys);
     if (!$data) {
-      return;
+      return [];
     }
 
+    $images = [];
     foreach ($data as $image_data) {
-      $images[] = $this->extractData($image_data, ['fields', 'DocumentRef', 0, '_id']);
+      $images[] = $this->extractData($image_data, [
+        'fields',
+        'DocumentRef',
+        0,
+        '_id',
+      ]);
     }
     return $images;
   }
 
   /**
-   * Computes the (published) status of the image, evaluating the key
-   * '_rights_effective'.
+   * Computes the (published) status of the image.
    *
-   * Searches for a right with the topic_id 'dcxapi:tm_topic/rightsusage-Online'.
+   * Evaluating the key '_rights_effective'.
+   *
+   * Searches for a right with the topic_id
+   * 'dcxapi:tm_topic/rightsusage-UsagePermittedDigital'.
    *
    * @param array $json
+   *   Data array.
    *
    * @return bool
    *   The status of the image. True if a right with topic_id
    *   'dcxapi:tm_topic/rightsusage-Online' is present, false otherwise
    */
-  protected function computeStatus($json) {
+  protected function computeStatus(array $json) {
     $rights_ids = $this->extractData($json, [
       '_rights_effective',
       'rightstype-UsagePermittedDigital',
     ]);
-    foreach (current($rights_ids) as $right) {
-      $right_id = $right['_id'];
-      $dereferenced_right_id = $json['_referenced']['dcx:rights'][$right_id]['properties']['topic_id']['_id'];
-      if ('dcxapi:tm_topic/rightsusage-Online' == $dereferenced_right_id) {
-        return TRUE;
+    if (is_array($rights_ids)) {
+      foreach (current($rights_ids) as $right) {
+        $right_id = $right['_id'];
+        $dereferenced_right_id = $json['_referenced']['dcx:rights'][$right_id]['properties']['topic_id']['_id'];
+        if ('dcxapi:tm_topic/rightsusage-Online' == $dereferenced_right_id) {
+          return TRUE;
+        }
       }
     }
+
     return FALSE;
   }
 
   /**
-   * Computes the expired of the image, evaluating the key
-   * '_rights_effective'.
+   * Returns comma separated string of values of the list referenced by $keys.
    *
-   * Searches for a right with the topic_id 'dcxapi:tm_topic/rightsusage-Online'.
+   * Use to collect the values of a multi values DC-X field.
    *
    * @param array $json
-   *
-   * @return string
-   *   date string of expired date
-   */
-  protected function computeExpire($json) {
-    // As it is implemented right now, this returns a DateTime instance
-    // representing the current date if no data is available in $json.
-    // It breaks sites using this.
-    $rights_ids = $this->extractData($json, [
-      '_rights_effective',
-      'rightstype-UsagePermitted',
-    ]);
-    foreach (current($rights_ids) as $right) {
-      $right_id = $right['_id'];
-      $dereferenced_right_id = $json['_referenced']['dcx:rights'][$right_id]['properties']['topic_id']['_id'];
-      if ('dcxapi:tm_topic/rightsusage-Online' == $dereferenced_right_id) {
-        if (isset($right['from_date']) && isset($right['to_date']) && empty($right['to_date'])) {
-          $date = new \DateTime($right['from_date']);
-          return $date->format('Y-m-d');
-        }
-        if (isset($right['to_date'])) {
-          $date = new \DateTime($right['to_date']);
-          return $date->format('Y-m-d');
-        }
-        return NULL;
-      }
-    }
-    return FALSE;
-  }
-
-  /**
-   * Returns a comma separated string of the values of the list referenced by
-   * $keys. Use to collect the values of a multi values DC-X field.
-   *
+   *   Data array.
    * @param array $keys
-   * @param array $json
+   *   Keys to look for.
    *
    * @return string
    *   The referenced values as comma separated string.
    */
-  protected function joinValues($json, $keys) {
+  protected function joinValues(array $json, array $keys) {
     $items = $this->extractData($json, $keys);
 
     $values = [];
@@ -421,14 +418,14 @@ class JsonClient implements ClientInterface {
   /**
    * {@inheritdoc}
    */
-  public function trackUsage($used_entities, $path, $published, $type) {
+  public function trackUsage(array $used_entities, $path, $published, $type) {
 
     $dcx_status = $published ? 'pubstatus-published' : 'pubstatus-unpublished';
 
     $dateTime = new \DateTime();
     $date = $dateTime->format(\DateTime::W3C);
 
-    $dcx_publication = $this->publication_id;
+    $dcx_publication = $this->publicationId;
 
     $known_publications = $this->pubinfoOnPath($path, $type);
 
@@ -449,8 +446,8 @@ class JsonClient implements ClientInterface {
           // we need to make sure that the id is actually encoded in the data,
           // because it's supposed to be called by a http_client.
           'callback_url' => '/dcx-notification?id=' . urlencode($id),
-          'entity_id' => $entity->id(),
-          'entity_type' => $entity->getEntityTypeId(),
+          'entity_id' => $entity['id'],
+          'entity_type' => $entity['entity_type_id'],
         ],
         "properties" => [
           "doc_id" => [
@@ -486,10 +483,10 @@ class JsonClient implements ClientInterface {
       }
       $response_body = NULL;
       if (0 == count($pubinfo)) {
-        $http_status = $this->api_client->createObject('pubinfo', [], $data, $response_body);
+        $http_status = $this->dcxApiClient->createObject('pubinfo', [], $data, $response_body);
         if (201 !== $http_status) {
           $exception = new DcxClientException('createObject', $http_status, 'pubinfo', [], $data);
-          $this->watchdog_exception(__METHOD__, $exception);
+          $this->watchdogException(__METHOD__, $exception);
           throw $exception;
         }
       }
@@ -502,10 +499,10 @@ class JsonClient implements ClientInterface {
         $data['properties']['_modcount'] = $modcount;
         $data['_id'] = $pubinfo['_id'];
 
-        $http_status = $this->api_client->setObject($dcx_api_url, [], $data, $response_body);
+        $http_status = $this->dcxApiClient->setObject($dcx_api_url, [], $data, $response_body);
         if (200 !== $http_status) {
           $exception = new DcxClientException('createObject', $http_status, $dcx_api_url, [], $data);
-          $this->watchdog_exception(__METHOD__, $exception);
+          $this->watchdogException(__METHOD__, $exception);
           throw $exception;
         }
       }
@@ -515,8 +512,10 @@ class JsonClient implements ClientInterface {
   /**
    * {@inheritdoc}
    */
-  public function archiveArticle($url, $info, $dcx_id) {
+  public function archiveArticle($url, array $info, $dcx_id) {
 
+    $id = isset($info['id']) ? $info['id'] : '';
+    $entity_type_id = isset($info['entity_type_id']) ? $info['entity_type_id'] : '';
     $title = isset($info['title']) ? $info['title'] : '';
     $status = isset($info['status']) ? $info['status'] : FALSE;
     $body = isset($info['body']) ? $info['body'] : '';
@@ -553,7 +552,7 @@ class JsonClient implements ClientInterface {
       ],
       'properties' => [
         'pool_id' => [
-          '_id' => '/dcx/api/pool/native',
+          '_id' => '/dcx/api/pool/story',
           '_type' => 'dcx:pool',
         ],
       ],
@@ -603,11 +602,11 @@ class JsonClient implements ClientInterface {
       $data['properties']['_modcount'] = $modcount;
       $data['_id'] = '/dcx/api/' . $dcx_id;
       $dcx_api_url = $dcx_id;
-      $http_status = $this->api_client->setObject($dcx_api_url, [], $data, $response_body);
+      $http_status = $this->dcxApiClient->setObject($dcx_api_url, [], $data, $response_body);
     }
     else {
       $dcx_api_url = 'document';
-      $http_status = $this->api_client->createObject($dcx_api_url, [], $data, $response_body);
+      $http_status = $this->dcxApiClient->createObject($dcx_api_url, [], $data, $response_body);
     }
     $error = FALSE;
 
@@ -639,7 +638,7 @@ class JsonClient implements ClientInterface {
 
       $url = parse_url($url)['path'];
 
-      $this->trackUsage(["dcxapi:$dcx_id"], ltrim($url, '/'), $status, 'article');
+      $this->trackUsage(["dcxapi:$dcx_id" => ['id' => $id, 'entity_type_id' => $entity_type_id]], ltrim($url, '/'), $status, 'article');
     }
     else {
       if (!$error) {
@@ -650,7 +649,7 @@ class JsonClient implements ClientInterface {
 
     if ($error) {
       $exception = new DcxClientException('createObject|setObject', $http_status, $dcx_api_url, [], $data, sprintf('Unable to archive: %s', $message));
-      $this->watchdog_exception(__METHOD__, $exception);
+      $this->watchdogException(__METHOD__, $exception);
       throw $exception;
     }
 
@@ -671,17 +670,17 @@ class JsonClient implements ClientInterface {
       'q[type_id]' => "pubtype-$type",
     ];
 
-    $http_status = $this->api_client->getObject('pubinfo', $params, $json);
+    $http_status = $this->dcxApiClient->get('pubinfo', $params, $json);
     if (200 !== $http_status) {
-      $exception = new DcxClientException('getObject', $http_status, 'pubinfo', $params, $json);
-      $this->watchdog_exception(__METHOD__, $exception);
+      $exception = new DcxClientException('get', $http_status, 'pubinfo', $params, $json);
+      $this->watchdogException(__METHOD__, $exception);
       throw $exception;
     }
 
     $pubinfo = [];
     foreach ($json['entries'] as $entry) {
       // Ignore entry, if the publication id of this entry does not match ours.
-      if ("dcxapi:tm_topic/" . $this->publication_id !== $entry['properties']['publication_id']['_id']) {
+      if ("dcxapi:tm_topic/" . $this->publicationId !== $entry['properties']['publication_id']['_id']) {
         continue;
       }
       $doc_id = $entry['properties']['doc_id']['_id'];
@@ -702,14 +701,14 @@ class JsonClient implements ClientInterface {
    *
    * @throws \Exception
    */
-  protected function removePubinfos($pubinfos) {
+  protected function removePubinfos(array $pubinfos) {
     $response_body = 'we know we wont evaluate this ;)';
     foreach ($pubinfos as $data) {
       $dcx_api_url = $data['_id_url'];
-      $http_status = $this->api_client->deleteObject($dcx_api_url, [], $response_body);
+      $http_status = $this->dcxApiClient->deleteObject($dcx_api_url, [], $response_body);
       if (204 != $http_status) {
         $exception = new DcxClientException('deleteObject', $http_status, $dcx_api_url);
-        $this->watchdog_exception(__METHOD__, $exception);
+        $this->watchdogException(__METHOD__, $exception);
         throw $exception;
       }
     }
@@ -737,6 +736,7 @@ class JsonClient implements ClientInterface {
 
   /**
    * Retrieve all usage information about the given DC-X ID on the current site.
+   *
    * May be filtered by a certain entity (say media:image) instance.
    *
    * @param string $dcx_id
@@ -745,23 +745,27 @@ class JsonClient implements ClientInterface {
    *   Entity type of the entity representing the dcx_id.
    * @param int $entity_id
    *   Entity id of the entity representing the dcx_id.
+   *
+   * @return array
+   *   Usages of an document.
    */
   protected function getAllUsage($dcx_id, $entity_type = NULL, $entity_id = NULL) {
     $document = $this->getJson($dcx_id);
     $pubinfos = $document['_referenced']['dcx:pubinfo'];
 
     $selected_pubinfos = [];
-    foreach ($pubinfos as $key => $pubinfo) {
-      if ("dcxapi:tm_topic/" . $this->publication_id === $pubinfo['properties']['publication_id']['_id']) {
+    foreach ($pubinfos as $pubinfo) {
+      if ("dcxapi:tm_topic/" . $this->publicationId === $pubinfo['properties']['publication_id']['_id']) {
         // If either type or id is not set, find all.
         if (!$entity_type || !$entity_id) {
           $selected_pubinfos[$pubinfo['properties']['uri']] = $pubinfo;
         }
         // If pubinfo contains type and id both equal to the given one, find it.
         elseif (isset($pubinfo['info']['entity_type'])
-            && isset($pubinfo['info']['entity_id'])
-            && $pubinfo['info']['entity_type'] == $entity_type
-            && $pubinfo['info']['entity_id'] == $entity_id) {
+          && isset($pubinfo['info']['entity_id'])
+          && $pubinfo['info']['entity_type'] == $entity_type
+          && $pubinfo['info']['entity_id'] == $entity_id
+        ) {
           $selected_pubinfos[$pubinfo['properties']['uri']] = $pubinfo;
         }
       }
@@ -775,7 +779,7 @@ class JsonClient implements ClientInterface {
    *
    * Global watchdog_exception is not unit testable. :( This method is.
    */
-  protected function watchdog_exception($type, \Exception $exception, $message = NULL, $variables = [], $severity = RfcLogLevel::ERROR, $link = NULL) {
+  protected function watchdogException($type, \Exception $exception, $message = NULL, $variables = [], $severity = RfcLogLevel::ERROR, $link = NULL) {
     if (empty($message)) {
       $message = '%type: @message in %function (line %line of %file).';
     }
@@ -806,7 +810,7 @@ class JsonClient implements ClientInterface {
       ],
     ];
 
-    $this->api_client->getObject('usertag', $params, $usertags);
+    $this->dcxApiClient->get('usertag', $params, $usertags);
 
     $collections = [];
     foreach ($usertags['entries'] as $usertag) {
@@ -837,7 +841,13 @@ class JsonClient implements ClientInterface {
   }
 
   /**
+   * Retrieve all docs of a collection.
    *
+   * @param string $utag_id
+   *   Id of a collection.
+   *
+   * @return array
+   *   Documents of the given collection.
    */
   public function getDocsOfCollection($utag_id) {
     $doctoutag_params = [
@@ -846,7 +856,7 @@ class JsonClient implements ClientInterface {
       's[_referenced][dcx:document][s][files]' => '*',
     ];
 
-    $this->api_client->getObject('doctoutag', $doctoutag_params, $docs);
+    $this->dcxApiClient->get('doctoutag', $doctoutag_params, $docs);
 
     $documents = [];
 
@@ -872,15 +882,21 @@ class JsonClient implements ClientInterface {
     ];
 
     $url = preg_replace('/^dcxapi:/', '', $id);
-    $http_status = $this->api_client->getObject($url, $params, $json);
+    $http_status = $this->dcxApiClient->get($url, $params, $json);
 
     if (200 !== $http_status) {
-      $exception = new DcxClientException('getObject', $http_status, $url, $params, $json);
-      $this->watchdog_exception(__METHOD__, $exception);
+      $exception = new DcxClientException('get', $http_status, $url, $params, $json);
+      $this->watchdogException(__METHOD__, $exception);
       throw $exception;
     }
 
-    $variant_types = $this->processAttributeMap(['variants' => ['_files_index', 'variant_type', 'master']], $json);
+    $variant_types = $this->processAttributeMap([
+      'variants' => [
+        '_files_index',
+        'variant_type',
+        'master',
+      ],
+    ], $json);
 
     $thumb_id = $variant_types['variants']['thumbnail'];
 
