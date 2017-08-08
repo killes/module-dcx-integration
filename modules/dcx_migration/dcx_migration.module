@@ -14,9 +14,9 @@ use Drupal\Core\Entity\EntityInterface;
 function dcx_migration_media_delete(EntityInterface $entity) {
   // Remove the migrate map entry for this entity to allow remigration if the
   // table exists.
-  if (db_table_exists('migrate_map_dcx_migration')) {
-    $db = Database::getConnection('default');
-    $query = $db->delete('migrate_map_dcx_migration')
+  $db = Database::getConnection('default');
+  if ($db->schema()->tableExists('migrate_map_dcx_migration')) {
+    $db->delete('migrate_map_dcx_migration')
       ->condition('destid1', $entity->id())
       ->execute();
   }
